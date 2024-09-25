@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 import streamlit as st
 import sqlite3
 import yfinance as yf
@@ -17,6 +19,12 @@ import numpy as np
 from scipy.fft import fft, ifft
 import threading
 import functools
+
+# ---------------------------
+# Define the Database Path Dynamically
+# ---------------------------
+BASE_DIR = Path(__file__).parent
+DB_PATH = BASE_DIR / 'trading_bots.db'
 
 # ---------------------------
 # 1. Configure Logging
@@ -71,7 +79,7 @@ def init_db():
     """Initializes the SQLite database with necessary tables."""
     with db_lock:
         try:
-            with sqlite3.connect(r'G:\trade bots\trading_bot.db', timeout=30) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 c = conn.cursor()
                 # Create trades table
                 c.execute('''
@@ -110,7 +118,7 @@ def save_trade_to_db(trade: dict):
     """Saves a trade record to the database."""
     with db_lock:
         try:
-            with sqlite3.connect(r'G:\trade bots\trading_bot.db', timeout=30) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 c = conn.cursor()
                 c.execute('''
                     INSERT INTO trades (timestamp, bot_name, action, ticker, quantity, price, total_value, gain_loss)
@@ -136,7 +144,7 @@ def save_bot_to_db(bot):
     """Saves or updates a TradingBot instance in the database."""
     with db_lock:
         try:
-            with sqlite3.connect(r'G:\trade bots\trading_bot.db', timeout=30) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 c = conn.cursor()
                 portfolio_json = json.dumps(bot.portfolio)
                 # Convert last_trade_time to string without timezone for storage
@@ -164,7 +172,7 @@ def delete_bot_from_db(bot_name: str):
     """Deletes a TradingBot from the database by name."""
     with db_lock:
         try:
-            with sqlite3.connect(r'G:\trade bots\trading_bot.db', timeout=30) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 c = conn.cursor()
                 c.execute('DELETE FROM bots WHERE name=?', (bot_name,))
                 conn.commit()
@@ -177,7 +185,7 @@ def load_bots_from_db() -> List['TradingBot']:
     """Loads all TradingBot instances from the database."""
     with db_lock:
         try:
-            with sqlite3.connect(r'G:\trade bots\trading_bot.db', timeout=30) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 c = conn.cursor()
                 c.execute('SELECT * FROM bots')
                 bots_data = c.fetchall()
@@ -189,12 +197,22 @@ def load_bots_from_db() -> List['TradingBot']:
     eastern = pytz.timezone('US/Eastern')  # Define timezone once
     for bot_data in bots_data:
         name, balance, initial_balance, portfolio_json, strategy_name, trade_freq_minutes, last_trade_time_str = bot_data
-        portfolio = json.loads(portfolio_json)
+        try:
+            portfolio = json.loads(portfolio_json)
+        except json.JSONDecodeError as e:
+            logging.error(f"Error decoding portfolio JSON for bot '{name}': {e}")
+            portfolio = {}
+        
         if last_trade_time_str:
-            naive_datetime = datetime.strptime(last_trade_time_str, "%Y-%m-%d %H:%M:%S")
-            last_trade_time = eastern.localize(naive_datetime)
+            try:
+                naive_datetime = datetime.strptime(last_trade_time_str, "%Y-%m-%d %H:%M:%S")
+                last_trade_time = eastern.localize(naive_datetime)
+            except ValueError as e:
+                logging.error(f"Error parsing last_trade_time for bot '{name}': {e}")
+                last_trade_time = eastern.localize(datetime(1970, 1, 1))  # Or another suitable past date
         else:
             last_trade_time = eastern.localize(datetime(1970, 1, 1))  # Or another suitable past date
+        
         bot = TradingBot(
             name=name,
             initial_capital=initial_balance,
@@ -295,6 +313,39 @@ def get_historical_prices(ticker: str, days: int = 30) -> Optional[pd.DataFrame]
     except Exception as e:
         logging.error(f"Error fetching historical prices for {ticker}: {e}")
         return None
+
+def validate_tickers(tickers: List[str]) -> List[str]:
+    """Validates tickers by checking if current price data is available."""
+    current_prices = get_current_prices(tickers)
+    valid_tickers = [ticker for ticker, price in current_prices.items() if price is not None]
+    invalid_tickers = [ticker for ticker, price in current_prices.items() if price is None]
+    for ticker in invalid_tickers:
+        logging.warning(f"Ticker '{ticker}' is invalid or data is unavailable.")
+    return valid_tickers
+
+def wavelet_decomposition(data, wavelet='db4', max_requested_level=4):
+    """Performs wavelet decomposition and returns bulk trend and surface movements."""
+    try:
+        wavelet_obj = pywt.Wavelet(wavelet)
+        max_level = pywt.dwt_max_level(len(data), wavelet_obj.dec_len)
+        actual_level = min(max_requested_level, max_level)
+        if actual_level < max_requested_level:
+            logging.warning(
+                f"Requested wavelet decomposition level {max_requested_level} is too high for data length {len(data)} "
+                f"and wavelet '{wavelet}'. Using level {actual_level} instead."
+            )
+        coeffs = pywt.wavedec(data, wavelet, level=actual_level)
+        # Reconstruct the bulk trend by zeroing out detail coefficients
+        bulk_trend = pywt.waverec([coeffs[0]] + [np.zeros_like(c) for c in coeffs[1:]], wavelet)
+        # Ensure bulk_trend is the same length as data
+        bulk_trend = bulk_trend[:len(data)]
+        # Surface movements are the residuals
+        surface_movements = np.array(data) - bulk_trend
+        return bulk_trend, surface_movements
+    except Exception as e:
+        logging.error(f"Error in wavelet decomposition: {e}")
+        # Return the original data and zero residuals in case of error
+        return np.array(data), np.zeros_like(data)
 
 # ---------------------------
 # 5. Trading Strategies
@@ -585,7 +636,7 @@ def get_average_buy_price(bot_name: str, ticker: str) -> Optional[float]:
     """Calculates the average buy price for a specific ticker in a bot's portfolio."""
     with db_lock:
         try:
-            with sqlite3.connect(r'G:\trade bots\trading_bot.db', timeout=30) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 query = """
                     SELECT price, quantity 
                     FROM trades 
@@ -628,36 +679,12 @@ def get_bot_trade_history(bot_name: str) -> pd.DataFrame:
     """Fetches trade history for a specific bot."""
     with db_lock:
         try:
-            with sqlite3.connect(r'G:\trade bots\trading_bot.db', timeout=30) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 trades = pd.read_sql_query("SELECT * FROM trades WHERE bot_name = ? ORDER BY timestamp", conn, params=(bot_name,))
         except sqlite3.OperationalError as e:
             logging.error(f"OperationalError in get_bot_trade_history: {e}")
             trades = pd.DataFrame()
     return trades
-
-def wavelet_decomposition(data, wavelet='db4', max_requested_level=4):
-    """Performs wavelet decomposition and returns bulk trend and surface movements."""
-    try:
-        wavelet_obj = pywt.Wavelet(wavelet)
-        max_level = pywt.dwt_max_level(len(data), wavelet_obj.dec_len)
-        actual_level = min(max_requested_level, max_level)
-        if actual_level < max_requested_level:
-            logging.warning(
-                f"Requested wavelet decomposition level {max_requested_level} is too high for data length {len(data)} "
-                f"and wavelet '{wavelet}'. Using level {actual_level} instead."
-            )
-        coeffs = pywt.wavedec(data, wavelet, level=actual_level)
-        # Reconstruct the bulk trend by zeroing out detail coefficients
-        bulk_trend = pywt.waverec([coeffs[0]] + [np.zeros_like(c) for c in coeffs[1:]], wavelet)
-        # Ensure bulk_trend is the same length as data
-        bulk_trend = bulk_trend[:len(data)]
-        # Surface movements are the residuals
-        surface_movements = np.array(data) - bulk_trend
-        return bulk_trend, surface_movements
-    except Exception as e:
-        logging.error(f"Error in wavelet decomposition: {e}")
-        # Return the original data and zero residuals in case of error
-        return np.array(data), np.zeros_like(data)
 
 # ---------------------------
 # 8. Streamlit App Functions
@@ -713,7 +740,7 @@ def display_trade_history():
     st.header("📊 Overall Trade History")
     with db_lock:
         try:
-            with sqlite3.connect(r'G:\trade bots\trading_bot.db', timeout=30) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 trades = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 100", conn)
         except sqlite3.OperationalError as e:
             logging.error(f"OperationalError in display_trade_history: {e}")
